@@ -1,36 +1,200 @@
-# This is a basic workflow to help you get started with Actions
+name: crosstool-ng CI
 
-name: CI
-
-# Controls when the action will run. 
 on:
-  # Triggers the workflow on push or pull request events but only for the master branch
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+env:
+  TZ: Asia/Shanghai
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
+  UPLOAD_RELEASE: true
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+  crosstool:
+    runs-on: ${{ matrix.host }}
+    strategy:
+      matrix:
+        host: [
+          "ubuntu-18.04",
+          "macos-10.15",
+        ]
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
+      - name: "git checkout"
+        uses: actions/checkout@v2
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: "prereq Linux"
+        if: ${{ runner.os == 'Linux' }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          sudo apt-get install -y gperf help2man libtool-bin
+
+      - name: "prereq macOS"
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          brew install autoconf automake bash binutils gawk gnu-sed \
+               gnu-tar help2man ncurses
+
+      - name: "build ct-ng"
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            export PATH="$PATH:/usr/local/opt/binutils/bin"
+            export CPPFLAGS="-I/usr/local/opt/ncurses/include -I/usr/local/opt/gettext/include"
+            export LDFLAGS="-L/usr/local/opt/ncurses/lib -L/usr/local/opt/gettext/lib"
+          fi
+          ./bootstrap
+          ./configure --prefix=$PWD/.local/
+          make
+          make install
+          tar -cjf ct-ng.tar.bz2 .local/
+
+      - name: "upload ct-ng"
+        uses: actions/upload-artifact@v2
+        with:
+          name: crosstool.${{ matrix.host }}
+          path: ct-ng.tar.bz2
+
+      - name: "upload config.log"
+        uses: actions/upload-artifact@v2
+        with:
+          name: config.log.${{ matrix.host }}
+          path: config.log
+        if: ${{ always() }}
+
+  toolchains:
+    needs: crosstool
+    runs-on: ${{ matrix.host }}
+    strategy:
+      matrix:
+        host: [
+          "ubuntu-18.04",
+          "macos-10.15",
+        ]
+        sample: [
+          "mipsel-unknown-linux-gnu",
+        ]
+        exclude:
+          # Exclude mips64-*-linux-gnu because of <byteswap.h> usage in
+          # elf-entry.c for linux kernel headers.  <byteswap.h> is a GNU
+          # extension and doesn't exist on MacOS X
+          - host: "macos-10.15"
+            sample: "mips64-unknown-linux-gnu"
+    steps:
+      - name: Create case sensitive workspace volume for macOS
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          cd ..
+          rmdir crosstool-ng
+          hdiutil create ${HOME}/Workspace.sparseimage -volname crosstool-ng -type SPARSE -size 20g -fs HFSX
+          hdiutil mount ${HOME}/Workspace.sparseimage -mountroot /Users/runner/work/crosstool-ng
+          cd crosstool-ng
+
+      - name: "download ct-ng"
+        uses: actions/download-artifact@v2
+        with:
+          name: crosstool.${{ matrix.host }}
+
+      - name: "extract ct-ng"
+        run: |
+          tar -xjf ct-ng.tar.bz2
+
+      - name: "prereq Linux"
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get install -y gperf help2man libtool-bin
+          echo "$GITHUB_WORKSPACE/.local/bin" >> $GITHUB_PATH
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: "prereq macOS"
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          brew install autoconf automake bash binutils gawk gnu-sed \
+               gnu-tar help2man ncurses pkg-config
+          echo "$GITHUB_WORKSPACE/.local/bin" >> $GITHUB_PATH
+          sudo systemsetup -settimezone "$TZ"
+
+      - name: "build ${{ matrix.sample }} for ${{ matrix.host }}"
+        id: compile
+        run: |
+          mkdir -p src
+          ct-ng ${{ matrix.sample }}
+          sed -i -e '/CT_LOG_PROGRESS_BAR/s/y$/n/' .config
+          sed -i -e '/CT_LOCAL_TARBALLS_DIR/s/HOME/CT_TOP_DIR/' .config
+          sed -i -e '/CT_PREFIX_DIR/s/HOME/CT_TOP_DIR/' .config
+          ct-ng build
+          echo "::set-output name=bdate::$(date +"%Y.%m.%d")"
+          echo "::set-output name=status::success"
+
+      - name: "upload log"
+        uses: actions/upload-artifact@v2
+        with:
+          name: "${{ matrix.sample }}.${{ matrix.host }}.log"
+          path: |
+            build.log
+            .config
+        if: ${{ always() }}
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        tar -cjvf ${{ matrix.sample }}.tar.bz2 ./x-tools/*
+        echo "FILE_DATE=${{ steps.compile.outputs.bdate }}" >> $GITHUB_ENV
+        echo "FIRMWARE=${{ matrix.sample }}.tar.bz2" >> $GITHUB_ENV
+        echo "::set-output name=status::success"
+
+    - name: Upload firmware to cowtransfer
+      id: cowtransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
+        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
+        echo "::set-output name=url::$(cat cowtransfer.log | grep https | cut -f3 -d" ")"
+
+    - name: Upload firmware to WeTransfer
+      id: wetransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
+        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
+        echo "::set-output name=url::$(cat wetransfer.log | grep https | cut -f3 -d" ")"
+
+    - name: Generate release tag
+      id: tag
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "::set-output name=release_tag::${{ steps.compile.outputs.bdate }}"
+        touch release.txt
+        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
+        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
+        echo "::set-output name=status::success"
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.ACTION_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}
+
+    - name: Delete workflow runs
+      uses: GitRML/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.1.0
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 5
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.ACTION_TOKEN }}
