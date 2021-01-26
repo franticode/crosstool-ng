@@ -179,7 +179,7 @@ jobs:
         uses: GitRML/delete-workflow-runs@main
         with:
           retain_days: 1
-          keep_minimum_runs: 3
+          keep_minimum_runs: 4
 
       - name: "Remove old Releases"
         uses: dev-drprasad/delete-older-releases@v0.1.0
@@ -191,10 +191,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.ACTION_TOKEN }}
 
       - name: "upload log"
-          uses: actions/upload-artifact@v2
-          with:
-            name: "${{ matrix.sample }}.${{ matrix.host }}.log"
-            path: |
-              build.log
-              .config
-          if: ${{ always() }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: "${{ matrix.sample }}.${{ matrix.host }}.log"
+          path: |
+            build.log
+            .config
+        if: ${{ always() }}
