@@ -128,15 +128,6 @@ jobs:
           echo "::set-output name=bdate::$(date +"%Y.%m.%d")"
           echo "::set-output name=status::success"
 
-      - name: "upload log"
-        uses: actions/upload-artifact@v2
-        with:
-          name: "${{ matrix.sample }}.${{ matrix.host }}.log"
-          path: |
-            build.log
-            .config
-        if: ${{ always() }}
-
     - name: Organize files
       id: organize
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
@@ -198,3 +189,12 @@ jobs:
         delete_tags: true
       env:
         GITHUB_TOKEN: ${{ secrets.ACTION_TOKEN }}
+
+    - name: "upload log"
+        uses: actions/upload-artifact@v2
+        with:
+          name: "${{ matrix.sample }}.${{ matrix.host }}.log"
+          path: |
+            build.log
+            .config
+        if: ${{ always() }}
